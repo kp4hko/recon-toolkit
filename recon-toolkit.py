@@ -98,9 +98,22 @@ def search_asns(company_name):
 	cidr_report_page = requests.get('http://www.cidr-report.org/as2.0/autnums.html')
 	cidr_report_page_parsed = BeautifulSoup(cidr_report_page.text, 'html.parser')
 	asns = cidr_report_page_parsed.pre.contents
-
-	#for company in company_name:
-	print(asns[184490], asns[184491], len(asns))
+	asns.pop(0)
+	for company in company_name:
+		for as_num,comp in zip(asns[0::2], asns[1::2]):
+			if re.search(company, comp, re.IGNORECASE):
+				as_number = as_num.string.strip()
+				comp_desc = comp.string.strip()
+				asn_to_cidr_page = requests.get('http://www.cidr-report.org/cgi-bin/as-report?as=' + as_number + '&view=2.0')
+				asn_to_cidr_page_parsed = BeautifulSoup(asn_to_cidr_page.text, 'html.parser')
+				#print(asn_to_cidr_page_parsed.find_all('h3', string="NOT Announced"))
+				if len(asn_to_cidr_page_parsed.find_all('h3', string="NOT Announced")) == 0:
+					cidrs = asn_to_cidr_page_parsed.find_all('pre')[2].find_all('a')
+					cidrs.pop(0)
+					correct_cidrs = []
+					for cidr in cidrs:
+						correct_cidrs.append(cidr.contents[0].string)
+					print(as_number, comp_desc, ', '.join(correct_cidrs))
 
 
 
@@ -116,7 +129,7 @@ show_time("program started")
 subdoamins_found = []
 ip_addresses = {}
 
-if len(args.company_name) > 0:
+if args.company_name is not None:
 	search_asn_thread = Thread(target=search_asns, args=(args.company_name,))
 	search_asn_thread.start()
 
@@ -135,7 +148,7 @@ if not args.skip_scraping:
 if not args.skip_brutforcing:
 	brute_subdomains_with_massdns(args.domain)
 
-if len(args.company_name) > 0:
+if args.company_name is not None:
 	search_asn_thread.join()
 
 print(len(subdoamins_found))
