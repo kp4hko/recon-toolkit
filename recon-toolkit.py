@@ -4,6 +4,8 @@ from datetime import datetime
 from threading import Thread
 import re
 import json
+import requests
+from bs4 import BeautifulSoup
 
 def show_time(text_for_print):
 	if args.debug:
@@ -92,16 +94,31 @@ def execute_massdns(domains_to_test):
 						subdoamins_found.append({"domain" : new_entry[0], "cname": new_entry[2]})
 	return unique_names, names_resolved
 
+def search_asns(company_name):
+	cidr_report_page = requests.get('http://www.cidr-report.org/as2.0/autnums.html')
+	cidr_report_page_parsed = BeautifulSoup(cidr_report_page.text, 'html.parser')
+	asns = cidr_report_page_parsed.pre.contents
+
+	#for company in company_name:
+	print(asns[184490], asns[184491], len(asns))
+
+
+
 time_started = datetime.now()
 parser = argparse.ArgumentParser()
 parser.add_argument("domain", help="a root domain to start enum with")
 parser.add_argument("-d", "--debug", action="store_true", help="show timings")
 parser.add_argument("-s", "--skip-scraping", action="store_true", help="skip amass and subfinder")
 parser.add_argument("-b", "--skip-brutforcing", action="store_true", help="skip brute-forcing domain names with massdns")
+parser.add_argument("-c", "--company-name", action="append", help="company name to search through ASNs")
 args = parser.parse_args()
 show_time("program started")
 subdoamins_found = []
 ip_addresses = {}
+
+if len(args.company_name) > 0:
+	search_asn_thread = Thread(target=search_asns, args=(args.company_name,))
+	search_asn_thread.start()
 
 if not args.skip_scraping:
 	amass_thread = Thread(target=search_subdomains_with_amass, args=(args.domain,))
@@ -117,6 +134,9 @@ if not args.skip_scraping:
 
 if not args.skip_brutforcing:
 	brute_subdomains_with_massdns(args.domain)
+
+if len(args.company_name) > 0:
+	search_asn_thread.join()
 
 print(len(subdoamins_found))
 print(*subdoamins_found, sep='\n')
