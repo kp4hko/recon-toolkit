@@ -99,6 +99,7 @@ def search_asns(company_name):
 	cidr_report_page_parsed = BeautifulSoup(cidr_report_page.text, 'html.parser')
 	asns = cidr_report_page_parsed.pre.contents
 	asns.pop(0)
+	asns_to_choose = {}
 	for company in company_name:
 		for as_num,comp in zip(asns[0::2], asns[1::2]):
 			if re.search(company, comp, re.IGNORECASE):
@@ -106,14 +107,21 @@ def search_asns(company_name):
 				comp_desc = comp.string.strip()
 				asn_to_cidr_page = requests.get('http://www.cidr-report.org/cgi-bin/as-report?as=' + as_number + '&view=2.0')
 				asn_to_cidr_page_parsed = BeautifulSoup(asn_to_cidr_page.text, 'html.parser')
-				#print(asn_to_cidr_page_parsed.find_all('h3', string="NOT Announced"))
 				if len(asn_to_cidr_page_parsed.find_all('h3', string="NOT Announced")) == 0:
 					cidrs = asn_to_cidr_page_parsed.find_all('pre')[2].find_all('a')
 					cidrs.pop(0)
 					correct_cidrs = []
 					for cidr in cidrs:
 						correct_cidrs.append(cidr.contents[0].string)
-					print(as_number, comp_desc, ', '.join(correct_cidrs))
+					dict_ind_num = len(asns_to_choose)
+					print(dict_ind_num, as_number, comp_desc, ', '.join(correct_cidrs))
+					asns_to_choose[dict_ind_num] = correct_cidrs
+	user_choices_of_correct_asns = [int(x) for x in input('Choose what ASNs will be used in futher recon activities: ').split() if x.isdigit()]
+	for choice in user_choices_of_correct_asns:
+		if choice in asns_to_choose:
+			for asn in asns_to_choose[choice]:
+				if asn not in asns_in_scope:
+					asns_in_scope.append(asn)
 
 
 
@@ -128,6 +136,7 @@ args = parser.parse_args()
 show_time("program started")
 subdoamins_found = []
 ip_addresses = {}
+asns_in_scope = []
 
 if args.company_name is not None:
 	search_asn_thread = Thread(target=search_asns, args=(args.company_name,))
@@ -150,6 +159,7 @@ if not args.skip_brutforcing:
 
 if args.company_name is not None:
 	search_asn_thread.join()
+	print(*asns_in_scope, sep='\n')
 
 print(len(subdoamins_found))
 print(*subdoamins_found, sep='\n')
