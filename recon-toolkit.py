@@ -6,6 +6,7 @@ import re
 import json
 import requests
 from bs4 import BeautifulSoup
+import censys.ipv4
 
 def show_time(text_for_print):
 	if args.debug:
@@ -109,13 +110,14 @@ def search_asns(company_name):
 				asn_to_cidr_page_parsed = BeautifulSoup(asn_to_cidr_page.text, 'html.parser')
 				if len(asn_to_cidr_page_parsed.find_all('h3', string="NOT Announced")) == 0:
 					cidrs = asn_to_cidr_page_parsed.find_all('pre')[2].find_all('a')
-					cidrs.pop(0)
-					correct_cidrs = []
-					for cidr in cidrs:
-						correct_cidrs.append(cidr.contents[0].string)
-					dict_ind_num = len(asns_to_choose)
-					print(dict_ind_num, as_number, comp_desc, ', '.join(correct_cidrs))
-					asns_to_choose[dict_ind_num] = correct_cidrs
+					if len(cidrs) != 0:
+						cidrs.pop(0)
+						correct_cidrs = []
+						for cidr in cidrs:
+							correct_cidrs.append(cidr.contents[0].string)
+						dict_ind_num = len(asns_to_choose)
+						print(dict_ind_num, as_number, comp_desc, ', '.join(correct_cidrs))
+						asns_to_choose[dict_ind_num] = correct_cidrs
 	user_choices_of_correct_asns = [int(x) for x in input('Choose what ASNs will be used in futher recon activities: ').split() if x.isdigit()]
 	for choice in user_choices_of_correct_asns:
 		if choice in asns_to_choose:
@@ -123,6 +125,13 @@ def search_asns(company_name):
 				if asn not in asns_in_scope:
 					asns_in_scope.append(asn)
 
+def search_through_censys_for_new_hosts(root_domain):
+	with open('/root/.config/subfinder/config.json') as json_file:
+		api_keys = json.load(json_file)
+		censys_conn = censys.ipv4.CensysIPv4(api_id=api_keys["censysUsername"], api_secret=api_keys["censysSecret"])
+		domain_to_search = re.sub('\.', '\\.', root_domain)
+		for censys_search_result in censys_conn.search("443.https.tls.certificate.parsed.extensions.subject_alt_name.dns_names: /.*\." + domain_to_search + "/", ['ip']):
+			ip_addresses[censys_search_result['ip']] = None
 
 
 time_started = datetime.now()
@@ -131,6 +140,7 @@ parser.add_argument("domain", help="a root domain to start enum with")
 parser.add_argument("-d", "--debug", action="store_true", help="show timings")
 parser.add_argument("-s", "--skip-scraping", action="store_true", help="skip amass and subfinder")
 parser.add_argument("-b", "--skip-brutforcing", action="store_true", help="skip brute-forcing domain names with massdns")
+parser.add_argument("-cc", "--skip-censys", action="store_true", help="skip censys certificates search for new hosts")
 parser.add_argument("-c", "--company-name", action="append", help="company name to search through ASNs")
 args = parser.parse_args()
 show_time("program started")
@@ -160,6 +170,10 @@ if not args.skip_brutforcing:
 if args.company_name is not None:
 	search_asn_thread.join()
 	print(*asns_in_scope, sep='\n')
+
+if not args.skip_censys:
+	search_through_censys_for_new_hosts(args.domain)
+	print(json.dumps(ip_addresses, indent = 4))
 
 print(len(subdoamins_found))
 print(*subdoamins_found, sep='\n')
