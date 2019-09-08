@@ -7,6 +7,9 @@ import json
 import requests
 from bs4 import BeautifulSoup
 import censys.ipv4
+from netaddr import *
+import os
+import dns.resolver
 
 def show_time(text_for_print):
 	if args.debug:
@@ -56,8 +59,9 @@ def brute_subdomains_with_massdns(root_domain):
 	generated = "list for bruting generated: " + str(domains_count) + " to test"
 	show_time(generated)
 	show_time("brute-forcing subdomains started")
-	unique_names, _ = execute_massdns(list_of_subdomains_to_test)
+	unique_names, resolved_names = execute_massdns(list_of_subdomains_to_test)
 	show_time("brute-forcing subdomains finished")
+	print(resolved_names, "domain names found from brute-forcing")
 	print(unique_names, " unique domain names found from brute-forcing")
 
 def execute_massdns(domains_to_test):
@@ -92,11 +96,13 @@ def execute_massdns(domains_to_test):
 					if new_entry[1] == 'A':
 						subdoamins_found.append({"domain" : new_entry[0], "ip": [new_entry[2]]})
 					elif new_entry[1] == 'CNAME':
-						subdoamins_found.append({"domain" : new_entry[0], "cname": new_entry[2]})
+						subdoamins_found.append({"domain" : new_entry[0], "cname": new_entry[2]})						
 	return unique_names, names_resolved
 
 def search_asns(company_name):
+	show_time("getting ASNs list")
 	cidr_report_page = requests.get('http://www.cidr-report.org/as2.0/autnums.html')
+	show_time("ASNs list loaded, starting parsing")
 	cidr_report_page_parsed = BeautifulSoup(cidr_report_page.text, 'html.parser')
 	asns = cidr_report_page_parsed.pre.contents
 	asns.pop(0)
@@ -124,15 +130,51 @@ def search_asns(company_name):
 			for asn in asns_to_choose[choice]:
 				if asn not in asns_in_scope:
 					asns_in_scope.append(asn)
+	show_time("searching ASNs finished")
 
 def search_through_censys_for_new_hosts(root_domain):
+	show_time("starting censys analysis")
+	addressess = {}
 	with open('/root/.config/subfinder/config.json') as json_file:
 		api_keys = json.load(json_file)
 		censys_conn = censys.ipv4.CensysIPv4(api_id=api_keys["censysUsername"], api_secret=api_keys["censysSecret"])
 		domain_to_search = re.sub('\.', '\\.', root_domain)
 		for censys_search_result in censys_conn.search("443.https.tls.certificate.parsed.extensions.subject_alt_name.dns_names: /.*\." + domain_to_search + "/", ['ip']):
-			ip_addresses[censys_search_result['ip']] = None
+			addressess[censys_search_result['ip']] = None
+	show_time("censys analysis finished")
+	return addressess
 
+def scan_ports_of_target_hosts():
+	targets = list(ip_addresses.keys())
+	fifofile = '/tmp/masscan_output'
+	args_fc = ["/usr/bin/masscan", "-oJ", fifofile, "-p80,443", "--rate", "17000"]
+	args_fc.extend(targets)
+	masscan_output_parsed = []
+	popen = subprocess.run(args_fc)
+	for masscan_line in open(fifofile, 'r'):
+		if not re.search("finished", masscan_line, re.IGNORECASE):
+			line_to_add = masscan_line.strip().rstrip(',')
+			masscan_output_parsed.append(json.loads(line_to_add))
+	for result in masscan_output_parsed:
+		if 'ports' not in ip_addresses[result['ip']]:
+			ip_addresses[result['ip']]['ports'] = []
+			ip_addresses[result['ip']]['ports'].append(result['ports'][0]['port'])
+		else:
+			ip_addresses[result['ip']]['ports'].append(result['ports'][0]['port'])
+
+def resolve_cnames():
+	for domain in subdoamins_found:
+		if 'cname' in domain:
+			try:
+				answer = dns.resolver.query(domain['cname'], 'A')
+				for answ in answer:
+					if 'ip' in domain:
+						domain['ip'].append(answ.to_text())
+					else:
+						domain['ip'] = []
+						domain['ip'].append(answ.to_text())
+			except Exception:
+				pass
 
 time_started = datetime.now()
 parser = argparse.ArgumentParser()
@@ -141,6 +183,7 @@ parser.add_argument("-d", "--debug", action="store_true", help="show timings")
 parser.add_argument("-s", "--skip-scraping", action="store_true", help="skip amass and subfinder")
 parser.add_argument("-b", "--skip-brutforcing", action="store_true", help="skip brute-forcing domain names with massdns")
 parser.add_argument("-cc", "--skip-censys", action="store_true", help="skip censys certificates search for new hosts")
+parser.add_argument("-sp", "--skip-portscanning", action="store_true", help="skip scanning ports of found hosts")
 parser.add_argument("-c", "--company-name", action="append", help="company name to search through ASNs")
 args = parser.parse_args()
 show_time("program started")
@@ -167,14 +210,42 @@ if not args.skip_scraping:
 if not args.skip_brutforcing:
 	brute_subdomains_with_massdns(args.domain)
 
+if not args.skip_brutforcing or not args.skip_scraping:
+	resolve_cnames()
+	inter = 0
+	for target in subdoamins_found:
+		if 'ip' in target:
+			for ip in target['ip']:
+				if ip not in ip_addresses:
+					inter = inter + 1
+					ip_addresses[ip] = { 'source' : "subdomains searching" }
+	print(inter, " ip addressess found from subdomains searching")
+
 if args.company_name is not None:
 	search_asn_thread.join()
-	print(*asns_in_scope, sep='\n')
+	inter = 0
+	for asn in asns_in_scope:
+		ips = IPNetwork(asn)
+		for address in ips:
+			addr = str(address)
+			if addr not in ip_addresses:
+				inter = inter + 1
+				ip_addresses[addr] = { 'source' : "ASNs searching" }
+	print(inter, " ip addressess found from ASNs searching")
 
 if not args.skip_censys:
-	search_through_censys_for_new_hosts(args.domain)
-	print(json.dumps(ip_addresses, indent = 4))
+	censys_addressess = search_through_censys_for_new_hosts(args.domain)
+	inter = 0
+	for host in censys_addressess:
+		if host not in ip_addresses:
+			inter = inter + 1
+			ip_addresses[host] = { 'source' : "certificates search through censys" }
+	print(inter, " ip addressess found from search through certificates on censys")
 
+if not args.skip_portscanning:
+	scan_ports_of_target_hosts()
+
+print(json.dumps(ip_addresses, indent = 4))
 print(len(subdoamins_found))
 print(*subdoamins_found, sep='\n')
 
