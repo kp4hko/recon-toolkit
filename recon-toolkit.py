@@ -10,6 +10,13 @@ import censys.ipv4
 from netaddr import *
 import os
 import dns.resolver
+import http.client
+import random
+import ssl
+from _ctypes import PyObj_FromPtr
+import concurrent.futures
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 
 def show_time(text_for_print):
 	if args.debug:
@@ -18,7 +25,7 @@ def show_time(text_for_print):
 
 def search_subdomains_with_amass(root_domain):
 	show_time("amass started")
-	args_fc = ("/root/amass_3.0.18_linux_amd64/amass", "enum", "--passive", "-d", root_domain)
+	args_fc = ("/root/amass_v3.1.6_linux_amd64/amass", "enum", "--passive", "-d", root_domain)
 	execute_subdomain_searching_subprocess(args_fc)
 	show_time("amass finished")
 
@@ -139,8 +146,11 @@ def search_through_censys_for_new_hosts(root_domain):
 		api_keys = json.load(json_file)
 		censys_conn = censys.ipv4.CensysIPv4(api_id=api_keys["censysUsername"], api_secret=api_keys["censysSecret"])
 		domain_to_search = re.sub('\.', '\\.', root_domain)
-		for censys_search_result in censys_conn.search("443.https.tls.certificate.parsed.extensions.subject_alt_name.dns_names: /.*\." + domain_to_search + "/", ['ip']):
-			addressess[censys_search_result['ip']] = None
+		try:
+			for censys_search_result in censys_conn.search("443.https.tls.certificate.parsed.extensions.subject_alt_name.dns_names: /.*\." + domain_to_search + "/", ['ip', '443.https.tls.certificate.parsed.extensions.subject_alt_name.dns_names']):
+				addressess[censys_search_result['ip']] = censys_search_result['443.https.tls.certificate.parsed.extensions.subject_alt_name.dns_names']
+		except Exception as e:
+			print(e.__class__, e)
 	show_time("censys analysis finished")
 	return addressess
 
@@ -155,6 +165,7 @@ def scan_ports_of_target_hosts():
 		if not re.search("finished", masscan_line, re.IGNORECASE):
 			line_to_add = masscan_line.strip().rstrip(',')
 			masscan_output_parsed.append(json.loads(line_to_add))
+	os.remove(fifofile)
 	for result in masscan_output_parsed:
 		if 'ports' not in ip_addresses[result['ip']]:
 			ip_addresses[result['ip']]['ports'] = []
@@ -176,6 +187,170 @@ def resolve_cnames():
 			except Exception:
 				pass
 
+def test_targets_statuses(host, url, plain):
+	try:
+		if plain:
+			h1 = http.client.HTTPConnection(host, 80)
+		else:
+			h1 = http.client.HTTPSConnection(host, 443, context=ssl._create_unverified_context())
+	except Exception as e:
+		print(e.__class__, e, host, "SSL: ", not plain)
+		return 0, 0, False
+	headers =	{
+					'Host' : host,
+					'User-Agent' : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:69.0) Gecko/20100101 Firefox/69.0',
+					'Accept' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+					'Accept-Language' : 'en-US,en;q=0.5',
+					'DNT': 1,
+					'Connection': 'keep-alive',
+					'Upgrade-Insecure-Requests': 1
+				}
+	try:
+		h1.request("GET", url, body=None, headers=headers)
+	except Exception as e:
+		print(e.__class__, e, host, "SSL: ", not plain)
+		return 0, 0, False
+	r1 = h1.getresponse()
+	h1.close()
+	if r1.status == 301 or r1.status == 302 or r1.status == 303 or r1.status == 305 or r1.status == 307:
+		location = r1.getheader('Location')
+		if plain:
+			url = 'http://' + host + '/'
+		else:
+			url = 'https://' + host + '/'
+		if location.startswith(url) or location.startswith('/') or location.startswith(host + '/'):
+			reg = '^' + url
+			path = re.sub(reg, '',location)
+			path = '/' + path
+			status, url, has_content = test_targets_statuses(host, path, plain)
+			return status, url, has_content
+		else:
+			return r1.status, location, False
+	else:
+		return r1.status, url, True
+
+def acquaintance_with_targets():
+	show_time("generating list of targets")
+	for target in subdoamins_found:
+		if 'ip' in target:
+			ip_needed = ip_addresses[random.choice(target['ip'])]
+			if 'ports' in ip_needed:
+				for port in ip_needed['ports']:
+					if target['domain'] in ip_addresses:
+						ip_addresses[target['domain']]['ports'].append(port)
+					else:
+						ip_addresses[target['domain']] = {}
+						ip_addresses[target['domain']]['source'] = ip_needed['source']
+						ip_addresses[target['domain']]['ports'] = []
+						ip_addresses[target['domain']]['ports'].append(port)
+	show_time("list of targets generated, starting checking statuses")
+	with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+		for target, descr in ip_addresses.items():
+			if 'ports' in descr:
+				if 80 in descr['ports']:
+					executor.submit(process_test_targets_statuses_results, 80, True, target, descr)
+				if 443 in ip_addresses[target]['ports']:
+					executor.submit(process_test_targets_statuses_results, 443, False, target, descr)
+	show_time("targets http statuses checked")
+	if args.screenshoting:
+		do_screenshots_of_target_hosts()
+
+def process_test_targets_statuses_results(port_num, plain, targ, targ_contx):
+	status, url, has_content = test_targets_statuses(targ, "/", plain)
+	targ_contx[port_num] = {}
+	tar_port_list_info = targ_contx[port_num]
+	tar_port_list_info['http_status_code'] = status
+	if has_content:
+		tar_port_list_info['start_url'] = url
+		tar_port_list_info['has_content'] = True
+	else:
+		tar_port_list_info['redirect url'] = url					
+		tar_port_list_info['has_content'] = False
+
+def do_screenshots_of_target_hosts():
+	show_time("starting screenshoting targets")
+	options = Options()
+	options.headless = True
+	options.accept_untrusted_certs = True
+	options.assume_untrusted_cert_issuer = True
+	options.add_argument("--no-sandbox")
+	options.add_argument('--disable-dev-shm-usage')
+	driver = webdriver.Chrome(options=options)
+	os.makedirs(args.domain, exist_ok=True)
+	for key, value in ip_addresses.items():
+		if 80 in value:
+			if value[80]['has_content']:
+				execute_browser('http://', key, value[80]['start_url'], driver, value['source'], value[80]['http_status_code'])
+		if 443 in value:
+			if value[443]['has_content']:
+				execute_browser('https://', key, value[443]['start_url'], driver, value['source'], value[443]['http_status_code'])
+	driver.close()
+	driver.quit()
+	show_time("screenshoting targets finished")
+
+def execute_browser(scheme, host, start_url, browser, source, status_code):
+	browser.execute_script("window.open('');")
+	browser.switch_to.window(browser.window_handles[1])
+	browser.set_window_size(1366, 768)
+	url_for_ss = scheme + host + start_url
+	browser.get(url_for_ss)
+	scheme_for_filename = scheme[:-3]
+	#url_for_save_results = url_for_ss.replace("/", "")
+	browser.save_screenshot(args.domain + '/' + str(status_code) + '_' + host + '_' + scheme_for_filename + '_(' + source + ')' + '.png')
+	browser.close()
+	browser.switch_to.window(browser.window_handles[0])
+
+#####################################################################################
+#####################################################################################
+#						stackoverflow copy-paste started 							#
+#					  https://stackoverflow.com/a/13252112 							#
+#####################################################################################
+#####################################################################################
+class NoIndent(object):
+	""" Value wrapper. """
+	def __init__(self, value):
+		self.value = value
+
+
+class MyEncoder(json.JSONEncoder):
+	FORMAT_SPEC = '@@{}@@'
+	regex = re.compile(FORMAT_SPEC.format(r'(\d+)'))
+
+	def __init__(self, **kwargs):
+		# Save copy of any keyword argument values needed for use here.
+		self.__sort_keys = kwargs.get('sort_keys', None)
+		super(MyEncoder, self).__init__(**kwargs)
+
+	def default(self, obj):
+		return (self.FORMAT_SPEC.format(id(obj)) if isinstance(obj, NoIndent)
+				else super(MyEncoder, self).default(obj))
+
+	def encode(self, obj):
+		format_spec = self.FORMAT_SPEC  # Local var to expedite access.
+		json_repr = super(MyEncoder, self).encode(obj)  # Default JSON.
+
+		# Replace any marked-up object ids in the JSON repr with the
+		# value returned from the json.dumps() of the corresponding
+		# wrapped Python object.
+		for match in self.regex.finditer(json_repr):
+			# see https://stackoverflow.com/a/15012814/355230
+			id = int(match.group(1))
+			no_indent = PyObj_FromPtr(id)
+			json_obj_repr = json.dumps(no_indent.value, sort_keys=self.__sort_keys)
+
+			# Replace the matched id string with json formatted representation
+			# of the corresponding Python object.
+			json_repr = json_repr.replace(
+							'"{}"'.format(format_spec.format(id)), json_obj_repr)
+
+		return json_repr
+#####################################################################################
+#####################################################################################
+#						stackoverflow copy-paste finished 							#
+#														 							#
+#####################################################################################
+#####################################################################################
+
 time_started = datetime.now()
 parser = argparse.ArgumentParser()
 parser.add_argument("domain", help="a root domain to start enum with")
@@ -185,6 +360,9 @@ parser.add_argument("-b", "--skip-brutforcing", action="store_true", help="skip 
 parser.add_argument("-cc", "--skip-censys", action="store_true", help="skip censys certificates search for new hosts")
 parser.add_argument("-sp", "--skip-portscanning", action="store_true", help="skip scanning ports of found hosts")
 parser.add_argument("-c", "--company-name", action="append", help="company name to search through ASNs")
+parser.add_argument("-ch", "--check-http-statuses", action="store_true", help="check http responses' statuses of targets (requires port-scanning)")
+parser.add_argument("-ss", "--screenshoting", action="store_true", help="do screenshots of findings (enables --check-http-statuses)")
+parser.add_argument("-sf", "--save-results", action="store_true", help="save json with results to file")
 args = parser.parse_args()
 show_time("program started")
 subdoamins_found = []
@@ -219,6 +397,10 @@ if not args.skip_brutforcing or not args.skip_scraping:
 				if ip not in ip_addresses:
 					inter = inter + 1
 					ip_addresses[ip] = { 'source' : "subdomains searching" }
+					ip_addresses[ip]['resolved_from'] = []
+					ip_addresses[ip]['resolved_from'].append(target['domain'])
+				else:
+					ip_addresses[ip]['resolved_from'].append(target['domain'])
 	print(inter, " ip addressess found from subdomains searching")
 
 if args.company_name is not None:
@@ -236,18 +418,48 @@ if args.company_name is not None:
 if not args.skip_censys:
 	censys_addressess = search_through_censys_for_new_hosts(args.domain)
 	inter = 0
-	for host in censys_addressess:
+	for host, cn in censys_addressess.items():
 		if host not in ip_addresses:
 			inter = inter + 1
-			ip_addresses[host] = { 'source' : "certificates search through censys" }
+			ip_addresses[host] = { 'source' : "certificates search through censys", 'subject_alt_names' : cn }
+		else:
+			ip_addresses[host]['subject_alt_names'] = cn
 	print(inter, " ip addressess found from search through certificates on censys")
 
 if not args.skip_portscanning:
 	scan_ports_of_target_hosts()
 
-print(json.dumps(ip_addresses, indent = 4))
-print(len(subdoamins_found))
-print(*subdoamins_found, sep='\n')
+if args.check_http_statuses or args.screenshoting:
+	if args.skip_portscanning:
+		print("checking http statuses won't work when port-scanning is skipped")
+	else:
+		acquaintance_with_targets()
+
+ip_addresses_to_print = ip_addresses.copy()
+keys_to_del = []
+for key, value in ip_addresses_to_print.items():
+	if 'ports' in value:
+		for k, v in value.items():
+			value[k] = NoIndent(v)
+	else:
+		if not args.skip_portscanning:
+			keys_to_del.append(key)
+		else:
+			for k, v in value.items():
+				value[k] = NoIndent(v)
+
+for key in keys_to_del:
+	ip_addresses_to_print.pop(key)
+
+print(json.dumps(ip_addresses_to_print, indent = 4, cls=MyEncoder))
+
+if args.save_results:
+	if not args.check_http_statuses and not args.screenshoting:
+		os.makedirs(args.domain, exist_ok=True)
+	with open(args.domain + '/results.json', 'w') as f:
+		f.write(json.dumps(ip_addresses_to_print, ensure_ascii=False, indent = 4, cls=MyEncoder))
+#print(len(subdoamins_found))
+#print(*subdoamins_found, sep='\n')
 
 time_finished = datetime.now()
 if args.debug:
